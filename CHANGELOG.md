@@ -1,3 +1,11 @@
+# Reader fork — Unreleased
+
+### Fixed
+* Opening a Realm with a malformed persisted cluster now returns a recoverable invalid-database error instead of terminating the process. Observed on pinned base `b4192c46305570577c4d08df790fddec5ab3aa04`; the introducing version is unestablished.
+<!-- Draft PR: https://github.com/aehlke/realm-core/pull/1 -->
+
+----------------------------------------------
+
 # NEXT RELEASE
 
 ### Enhancements

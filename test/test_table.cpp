@@ -23,6 +23,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <vector>
 #include <fstream>
 #include <ostream>
 #include <set>
@@ -31,6 +32,8 @@
 using namespace std::chrono;
 
 #include <realm.hpp>
+#include <realm/alloc_slab.hpp>
+#include <realm/cluster.hpp>
 #include <realm/util/buffer.hpp>
 #include <realm/util/to_string.hpp>
 #include <realm/util/base64.hpp>
@@ -5370,6 +5373,62 @@ TEST(Table_LoggingMutations)
     CHECK(str.find("VIEW { 5 element(s) }") != std::string::npos);
     CHECK(str.find("Set 'any' to dictionary") != std::string::npos);
     CHECK(str.find("Set 'any' to list") != std::string::npos);
+}
+
+
+TEST(Table_PersistedClusterMissingRefsReturnsInvalidDatabase)
+{
+    Group original;
+    auto table = original.add_table("cluster_header_control");
+    auto column = table->add_column(type_Int, "value");
+    table->create_object(ObjKey(0)).set(column, 10);
+    table->create_object(ObjKey(1)).set(column, 20);
+
+    // Group owns the serialized healthy buffer. No archived input is changed.
+    auto buffer = original.write_to_mem();
+    Group persisted(buffer);
+    ref_type leaf_ref = 0;
+    size_t leaves = 0;
+    persisted.get_table("cluster_header_control")->traverse_clusters([&](const Cluster* leaf) {
+        leaf_ref = leaf->get_ref();
+        ++leaves;
+        return IteratorControl::AdvanceToNext;
+    });
+    CHECK_EQUAL(leaves, 1);
+    CHECK_NOT_EQUAL(leaf_ref, 0);
+    if (leaves != 1 || leaf_ref == 0)
+        return;
+    auto& healthy_alloc = _impl::GroupFriend::get_alloc(persisted);
+    CHECK(healthy_alloc.is_read_only(leaf_ref));
+    CHECK(leaf_ref <= buffer.size() - 8);
+    if (!healthy_alloc.is_read_only(leaf_ref) || leaf_ref > buffer.size() - 8)
+        return;
+    ClusterTree healthy_tree(nullptr, healthy_alloc, 0);
+    Cluster healthy(0, healthy_alloc, healthy_tree);
+    CHECK_NOTHROW(healthy.init(MemRef(healthy_alloc.translate(leaf_ref), leaf_ref, healthy_alloc)));
+    CHECK_EQUAL(healthy.node_size(), 2);
+
+    // Corrupt only a test-owned copy of an otherwise valid immutable buffer.
+    // A SlabAlloc attachment validates the file header without admitting rows.
+    std::vector<char> malformed(buffer.data(), buffer.data() + buffer.size());
+    NodeHeader::set_hasrefs_in_header(false, malformed.data() + leaf_ref);
+    SlabAlloc malformed_alloc;
+    malformed_alloc.attach_buffer(malformed.data(), malformed.size());
+    CHECK(malformed_alloc.is_read_only(leaf_ref));
+    ClusterTree malformed_tree(nullptr, malformed_alloc, 0);
+    Cluster malformed_leaf(0, malformed_alloc, malformed_tree);
+    CHECK_THROW_ERROR(malformed_leaf.init(MemRef(malformed_alloc.translate(leaf_ref), leaf_ref, malformed_alloc)),
+                      InvalidDatabase, "persisted cluster header is missing the references flag");
+
+    // Ordinary mutable construction remains outside the persisted-file guard.
+    auto& mutable_alloc = Allocator::get_default();
+    auto mem = Cluster::create_empty_cluster(mutable_alloc);
+    CHECK(!mutable_alloc.is_read_only(mem.get_ref()));
+    ClusterTree mutable_tree(nullptr, mutable_alloc, 0);
+    Cluster mutable_leaf(0, mutable_alloc, mutable_tree);
+    CHECK_NOTHROW(mutable_leaf.init(mem));
+    CHECK_EQUAL(mutable_leaf.node_size(), 0);
+    mutable_leaf.destroy();
 }
 
 #endif // TEST_TABLE

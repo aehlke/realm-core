@@ -17,6 +17,7 @@
  **************************************************************************/
 
 #include "realm/cluster.hpp"
+#include "realm/exceptions.hpp"
 #include "realm/array_integer.hpp"
 #include "realm/array_basic.hpp"
 #include "realm/array_bool.hpp"
@@ -207,6 +208,13 @@ void Cluster::create()
 void Cluster::init(MemRef mem)
 {
     Array::init_from_mem(mem);
+    if (REALM_UNLIKELY(!has_refs() && m_alloc.is_read_only(mem.get_ref()))) {
+        // A cluster loaded from persistent storage must contain references.
+        // Mutable refs still reach the internal invariant below: a programming
+        // error in a newly allocated node is not an invalid input database.
+        throw RuntimeError(ErrorCodes::InvalidDatabase,
+                           "Invalid database: persisted cluster header is missing the references flag");
+    }
     auto rot = Array::get_as_ref_or_tagged(0);
     if (rot.is_tagged()) {
         m_keys.detach();
