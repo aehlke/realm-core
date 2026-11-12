@@ -282,6 +282,10 @@ std::shared_ptr<Realm> RealmCoordinator::freeze_realm(const Realm& source_realm)
     config.scheduler = scheduler;
     realm = Realm::make_shared_realm(std::move(config), version, shared_from_this());
     Realm::Internal::copy_schema(*realm, source_realm);
+    // Acquire the frozen version while the source still owns its read lock.
+    // Retaining only the DB and version number lets a later commit reclaim the
+    // snapshot before the frozen Realm's first read. Initialize before caching.
+    realm->read_group();
     m_weak_realm_notifiers.emplace_back(realm, config.cache);
     return realm;
 }

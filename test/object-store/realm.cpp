@@ -3816,6 +3816,8 @@ TEST_CASE("Frozen and cross-thread Realms retain the actual admitted DB capabili
     REQUIRE(cross_thread_different_denied);
     REQUIRE(frozen);
     REQUIRE(frozen->is_frozen());
+    // This observer does not start a read: freeze() itself must own the pin.
+    REQUIRE(frozen->is_in_read_transaction());
     REQUIRE(TestHelper::get_db(frozen) == actual_db);
     std::weak_ptr<Realm> weak_live = live;
     live.reset();

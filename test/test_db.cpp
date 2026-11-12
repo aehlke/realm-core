@@ -39,6 +39,7 @@ TEST(DB_getCoreFiles_adding_path)
 
 
 // Session admission regressions use the public DB path, not direct predicate calls.
+#include <realm/alloc_slab.hpp>
 #include <realm/transaction.hpp>
 #include <realm/history.hpp>
 #include <realm/session_admission.hpp>
@@ -69,6 +70,16 @@ std::string db_admission_bytes(const std::string& path)
     std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("Cannot read admission test fixture");
     return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+
+bool db_admission_is_streaming(const std::string& path)
+{
+    SlabAlloc alloc;
+    SlabAlloc::Config config;
+    config.read_only = true;
+    config.no_create = true;
+    alloc.attach_file(path, config);
+    return alloc.is_file_on_streaming_form();
 }
 
 void seed_db_admission_file(const std::string& path, int absent = -1, int nonempty = -1, int mismatch = -1)
@@ -185,6 +196,12 @@ TEST(DB_SessionAdmission_ActualSessionFencesNilAndDifferentCohorts)
 TEST(DB_SessionAdmission_LifecycleRetainsLockAndCoordinationInode)
 {
     SHARED_GROUP_TEST_PATH(path);
+    // call_with_lock() alone may create a valid zero-length lock file, which
+    // File::get_unique_id() deliberately does not identify on POSIX. Initialize
+    // real shared metadata through DB before using that API as an inode witness.
+    seed_db_admission_file(path);
+    auto initialized_lock_id = util::File::get_unique_id(path.get_lock_path());
+    CHECK(bool(initialized_lock_id));
     bool body_ran = false;
     std::optional<util::File::UniqueID> lock_id;
     CHECK(DB::call_with_lock(path, [&](const std::string&) {
@@ -192,6 +209,7 @@ TEST(DB_SessionAdmission_LifecycleRetainsLockAndCoordinationInode)
         CHECK(!DB::call_with_lock(path, [](const std::string&) {}));
         lock_id = util::File::get_unique_id(path.get_lock_path());
         CHECK(bool(lock_id));
+        CHECK(lock_id == initialized_lock_id);
     }));
     CHECK(body_ran);
     CHECK(lock_id == util::File::get_unique_id(path.get_lock_path()));
@@ -422,6 +440,7 @@ TEST(DB_SessionAdmission_DeniesBeforeStreamingHeaderNormalization)
         }
         auto before = db_admission_bytes(path);
         CHECK(before.substr(0, 8) == std::string(8, char(0xff)));
+        CHECK(db_admission_is_streaming(path));
         auto inode = util::File::get_unique_id(path);
         auto modified = util::File::last_write_time(path);
         DBOptions options;
@@ -430,7 +449,11 @@ TEST(DB_SessionAdmission_DeniesBeforeStreamingHeaderNormalization)
             auto admitted = DB::create(path, options);
             CHECK(admitted->start_read()->get_table("class_AdmissionA")->is_empty());
             admitted.reset();
-            CHECK(db_admission_bytes(path).substr(0, 8) != before.substr(0, 8));
+            // Normalization selects the second top-ref slot; the first eight
+            // bytes need not change. Check the actual physical header state.
+            CHECK(!db_admission_is_streaming(path));
+            CHECK(db_admission_bytes(path) != before);
+            CHECK(util::File::get_unique_id(path) == inode);
         }
         else {
             bool denied = false;
