@@ -121,6 +121,8 @@ def provenance(manifest_path, executable, role):
         assert key not in entries, "duplicate provenance key"
         entries[key] = value
     assert entries["role"] == role
+    assert entries["sdk_tests"] in {"ON", "OFF"}
+    assert role == "modern" or entries["sdk_tests"] == "OFF"
     assert entries["source_revision"]
     assert entries["db_sha256"] == entries["expected_db_sha256"]
     assert Path(entries["executable"]).resolve(strict=True) == executable
