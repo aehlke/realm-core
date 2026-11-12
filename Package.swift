@@ -52,6 +52,7 @@ let notSyncServerSources: [String] = [
     "realm/collection_parent.cpp",
     "realm/column_binary.cpp",
     "realm/db.cpp",
+    "realm/session_admission.cpp",
     "realm/decimal128.cpp",
     "realm/dictionary.cpp",
     "realm/disable_sync_to_disk.cpp",

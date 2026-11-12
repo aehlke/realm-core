@@ -34,6 +34,7 @@ set(REALM_SOURCES
     exceptions.cpp
     group.cpp
     db.cpp
+    session_admission.cpp
     group_writer.cpp
     history.cpp
     impl/copy_replication.cpp
@@ -149,6 +150,7 @@ set(REALM_INSTALL_HEADERS
     data_type.hpp
     db.hpp
     db_options.hpp
+    session_admission.hpp
     decimal128.hpp
     dictionary.hpp
     disable_sync_to_disk.hpp

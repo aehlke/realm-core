@@ -80,7 +80,8 @@ namespace {
 //         with a lock.
 // 13      New impl of VersionList and added mutex for it (former RingBuffer)
 // 14      Added field for tracking ongoing encrypted writes
-const uint_fast16_t g_shared_info_version = 14;
+// 15: immutable admitted-session identity before the variable VersionList.
+const uint_fast16_t g_shared_info_version = 15;
 
 
 struct VersionList {
@@ -439,10 +440,14 @@ struct alignas(8) DB::SharedInfo {
     std::atomic<uint64_t> writing_page_offset;
     std::atomic<uint64_t> write_counter;
 
+    // Fixed for this session and checked before any target-file attachment.
+    const SessionAdmission::Identity session_admission_identity;
+
     // IMPORTANT: The VersionList MUST be the last field in SharedInfo - see above.
     VersionList readers;
 
-    SharedInfo(Durability, Replication::HistoryType, int history_schema_version);
+    SharedInfo(Durability, Replication::HistoryType, int history_schema_version,
+               SessionAdmission::Identity admission = {});
     ~SharedInfo() noexcept {}
 
     void init_versioning(ref_type top_ref, size_t file_size, uint64_t initial_version)
@@ -453,11 +458,13 @@ struct alignas(8) DB::SharedInfo {
 };
 
 
-DB::SharedInfo::SharedInfo(Durability dura, Replication::HistoryType ht, int hsv)
+DB::SharedInfo::SharedInfo(Durability dura, Replication::HistoryType ht, int hsv,
+                           SessionAdmission::Identity admission)
     : size_of_mutex(sizeof(shared_writemutex))
     , size_of_condvar(sizeof(room_to_write))
     , shared_writemutex()   // Throws
     , shared_controlmutex() // Throws
+    , session_admission_identity(admission)
 {
     durability = static_cast<uint16_t>(dura); // durability level is fixed from creation
     REALM_ASSERT(!util::int_cast_has_overflow<decltype(history_type)>(ht + 0));
@@ -919,6 +926,14 @@ void DB::open(const std::string& path, const DBOptions& options)
     SlabAlloc& alloc = m_alloc;
     ref_type top_ref = 0;
 
+    if (options.session_admission && (options.is_immutable || options.durability != Durability::Full
+                                      || options.clear_on_invalid_file)) {
+        throw SessionAdmissionError(SessionAdmissionError::Reason::unsupported_configuration);
+    }
+    // Every mutable opener shares the adjacent lock namespace, including
+    // ordinary/nil admission. Immutable snapshots never acquire writer authority.
+    if (!options.is_immutable)
+        SessionAdmission::validate_payload_path(path);
     if (options.is_immutable) {
         SlabAlloc::Config cfg;
         cfg.read_only = true;
@@ -989,7 +1004,8 @@ void DB::open(const std::string& path, const DBOptions& options)
             File::UnmapGuard fug(m_file_map);
             SharedInfo* info = m_file_map.get_addr();
 
-            new (info) SharedInfo{options.durability, openers_hist_type, openers_hist_schema_version}; // Throws
+            new (info) SharedInfo{options.durability, openers_hist_type, openers_hist_schema_version,
+                                  SessionAdmission::identity_of(options.session_admission)}; // Throws
 
             // Because init_complete is an std::atomic, it's guaranteed not to be observable by others
             // as being 1 before the entire SharedInfo header has been written.
@@ -1088,6 +1104,9 @@ void DB::open(const std::string& path, const DBOptions& options)
             throw IncompatibleLockFile(path, format("Version mismatch: SharedInfo version is %1 but should be %2.",
                                                     info->shared_info_version, g_shared_info_version));
         }
+        if (info->session_admission_identity != SessionAdmission::identity_of(options.session_admission)) {
+            throw SessionAdmissionError(SessionAdmissionError::Reason::incompatible_session);
+        }
         // Validate compatible sizes of mutex and condvar types. Sizes of all
         // other fields are architecture independent, so if condvar and mutex
         // sizes match, the entire struct matches. The offsets of
@@ -1133,11 +1152,28 @@ void DB::open(const std::string& path, const DBOptions& options)
         // - Waiting for and signalling database changes
         {
             std::lock_guard<InterprocessMutex> lock(m_controlmutex); // Throws
+            // Recheck the named payload under the actual retained session lock
+            // and control mutex, including compatible joining participants.
+            SessionAdmission::validate_payload_path(path);
             auto version_manager = std::make_unique<FileVersionManager>(m_file, m_versionlist_mutex);
 
             // proceed to initialize versioning and other metadata information related to
             // the database. Also create the database if we're beginning a new session
             bool begin_new_session = (info->num_participants == 0);
+            if (begin_new_session && options.session_admission && File::exists(path)) {
+                // The validated cohort shared lock stays held through Group destruction,
+                // writable attachment and this DB lifetime. Matching peers wait here;
+                // incompatible peers cannot join the protocol. Never attach writable
+                // or normalize/restore/upgrade a file just to decide admission.
+                try {
+                    Group physical(path, options.encryption_key);
+                    options.session_admission->inspect(physical);
+                } catch (const SessionAdmissionError&) {
+                    throw;
+                } catch (...) {
+                    throw SessionAdmissionError(SessionAdmissionError::Reason::unreadable);
+                }
+            }
             SlabAlloc::Config cfg;
             cfg.session_initiator = begin_new_session;
             cfg.is_shared = true;
@@ -1173,6 +1209,13 @@ void DB::open(const std::string& path, const DBOptions& options)
                 Group::get_target_file_format_version_for_session(current_file_format_version, openers_hist_type);
             BackupHandler backup(path, options.accepted_versions, options.to_be_deleted);
             if (backup.must_restore_from_backup(current_file_format_version)) {
+                // A backup is a separate inherited store. It has not acquired
+                // this cohort or passed its predicate; never replace the target
+                // with it as a side effect of an admitted ordinary open.
+                if (options.session_admission) {
+                    alloc.detach();
+                    throw SessionAdmissionError(SessionAdmissionError::Reason::unreadable);
+                }
                 // we need to unmap before any file ops that'll change the realm
                 // file:
                 // (only strictly needed for Windows)
@@ -1182,7 +1225,9 @@ void DB::open(const std::string& path, const DBOptions& options)
                 // one:
                 continue;
             }
-            backup.cleanup_backups();
+            // Retained backup files are independent evidence owners, including
+            // when this canonical file is new. Admission never deletes them.
+            if (!options.session_admission) backup.cleanup_backups();
 
             // From here on, if we fail in any way, we must detach the
             // allocator.
@@ -1485,6 +1530,8 @@ void DB::open(Replication& repl, const std::string& file, const DBOptions& optio
     // it must leave the file closed.
 
     REALM_ASSERT(!is_attached());
+    if (!options.is_immutable)
+        SessionAdmission::validate_payload_path(file);
 
     repl.initialize(*this); // Throws
 
@@ -1600,6 +1647,7 @@ bool DB::compact(bool bump_version_number, std::optional<const char*> output_enc
     if (is_attached() == false) {
         throw Exception(ErrorCodes::IllegalOperation, m_db_path + ": compact must be done on an open/attached DB");
     }
+    SessionAdmission::validate_payload_path(m_db_path);
     auto info = m_info;
     Durability dura = Durability(info->durability);
     std::unique_ptr<char[]> key_buffer;
@@ -1618,6 +1666,7 @@ bool DB::compact(bool bump_version_number, std::optional<const char*> output_enc
 #endif
     {
         std::unique_lock<InterprocessMutex> lock(m_controlmutex); // Throws
+        SessionAdmission::validate_payload_path(m_db_path);
         auto t1 = std::chrono::steady_clock::now();
 
         // We must be the ONLY DB object attached if we're to do compaction
@@ -1706,6 +1755,7 @@ bool DB::compact(bool bump_version_number, std::optional<const char*> output_enc
 
 void DB::write_copy(std::string_view path, const char* output_encryption_key)
 {
+    SessionAdmission::validate_payload_path(std::string(path));
     auto tr = start_read();
     if (auto hist = tr->get_history()) {
         if (!hist->no_pending_local_changes(tr->get_version())) {
@@ -2607,6 +2657,7 @@ void DB::reserve(size_t size)
 
 bool DB::call_with_lock(const std::string& realm_path, CallbackWithLock&& callback)
 {
+    SessionAdmission::validate_payload_path(realm_path);
     auto lockfile_path = get_core_file(realm_path, CoreFileType::Lock);
 
     File lockfile;
@@ -2614,6 +2665,7 @@ bool DB::call_with_lock(const std::string& realm_path, CallbackWithLock&& callba
     File::CloseGuard fcg(lockfile);
     lockfile.set_fifo_path(realm_path + ".management", "lock.fifo");
     if (lockfile.try_rw_lock_exclusive()) { // Throws
+        SessionAdmission::validate_payload_path(realm_path);
         callback(realm_path);
         return true;
     }
@@ -2639,6 +2691,9 @@ std::string DB::get_core_file(const std::string& base_path, CoreFileType type)
 
 void DB::delete_files(const std::string& base_path, bool* did_delete, bool delete_lockfile)
 {
+    // The caller still owns synchronization and the explicit delete_lockfile
+    // contract. Alias refusal does not make this low-level helper acquire a lock.
+    SessionAdmission::validate_payload_path(base_path);
     if (File::try_remove(get_core_file(base_path, CoreFileType::Storage)) && did_delete) {
         *did_delete = true;
     }
@@ -2778,7 +2833,8 @@ void DB::async_request_write_mutex(TransactionRef& tr, util::UniqueFunction<void
 }
 
 inline DB::DB(Private, const DBOptions& options)
-    : m_upgrade_callback(std::move(options.upgrade_callback))
+    : m_session_admission(options.session_admission)
+    , m_upgrade_callback(std::move(options.upgrade_callback))
     , m_log_id(util::gen_log_id(this))
 {
     if (options.enable_async_writes) {

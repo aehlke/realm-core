@@ -393,9 +393,15 @@ public:
     // The lock taken precludes races with other threads or processes accessing the
     // files through a DB.
     // It is safe to delete/replace realm files inside the callback.
+    // Mutable payload aliases are rejected before lock creation and under the
+    // acquired lock. The payload/lock paths must remain stable for this advisory
+    // protocol, including parent aliases sharing both actual files.
     // WARNING: It is not safe to delete the lock file in the callback.
     using CallbackWithLock = util::FunctionRef<void(const std::string& realm_path)>;
     static bool call_with_lock(const std::string& realm_path, CallbackWithLock&& callback);
+
+    SessionAdmission::Identity session_admission_identity() const noexcept
+    { return SessionAdmission::identity_of(m_session_admission); }
 
     enum CoreFileType : uint8_t {
         Lock,
@@ -416,7 +422,10 @@ public:
     /// This function does not perform any locking and requires external
     /// synchronization to ensure that it is safe to call. If called within
     /// call_with_lock(), \p delete_lockfile must be false as the lockfile is not
-    /// safe to delete while it is in use.
+    /// safe to delete while it is in use. Terminal payload aliases are rejected
+    /// before effects, but this helper does not establish lifecycle ownership.
+    /// In particular delete_lockfile=true requires external exclusion of every
+    /// opener and is outside the retained-lock Reader lifecycle contract.
     ///
     /// \param base_path The Realm file to delete, which auxiliary file paths will be derived from.
     /// \param[out] did_delete_realm If non-null, will be set to true if the Realm file was deleted (even if a
@@ -503,6 +512,7 @@ private:
     util::InterprocessMutex m_versionlist_mutex;
     util::InterprocessCondVar m_new_commit_available;
     util::InterprocessCondVar m_pick_next_writer;
+    const std::shared_ptr<const SessionAdmission> m_session_admission;
     std::function<void(int, int)> m_upgrade_callback;
     std::unique_ptr<AsyncCommitHelper> m_commit_helper;
     std::shared_ptr<util::Logger> m_logger;

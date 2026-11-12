@@ -45,6 +45,21 @@ using namespace realm::_impl;
 static auto& s_coordinator_mutex = *new std::mutex;
 static auto& s_coordinators_per_path = *new std::unordered_map<std::string, std::weak_ptr<RealmCoordinator>>;
 
+namespace {
+void validate_mutable_payload(const Realm::Config& config)
+{
+    if (!config.immutable() && !config.in_memory && config.realm_data.is_null() && !config.path.empty())
+        SessionAdmission::validate_payload_path(config.path);
+}
+
+void remove_payload_with_lock(const std::string& path)
+{
+    if (!DB::call_with_lock(path, [](const std::string& owned_path) { util::File::remove(owned_path); }))
+        throw FileAccessError(ErrorCodes::DeleteOnOpenRealm,
+                              util::format("Cannot reset an open Realm: '%1' is still in use.", path), path);
+}
+} // namespace
+
 std::shared_ptr<RealmCoordinator> RealmCoordinator::get_coordinator(StringData path)
 {
     std::lock_guard<std::mutex> lock(s_coordinator_mutex);
@@ -77,6 +92,15 @@ std::shared_ptr<RealmCoordinator> RealmCoordinator::get_existing_coordinator(Str
 
 void RealmCoordinator::set_config(const Realm::Config& config)
 {
+    validate_mutable_payload(config);
+    if (config.session_admission && (config.immutable() || config.in_memory || !config.realm_data.is_null()
+                                     || config.path.empty() || config.schema_mode == SchemaMode::SoftResetFile
+                                     || config.schema_mode == SchemaMode::HardResetFile))
+        throw SessionAdmissionError(SessionAdmissionError::Reason::unsupported_configuration);
+    // m_config may be replaced after weak Realm entries expire while m_db lives.
+    // Only the actual DB capability is authority; never relabel it through config.
+    if (m_db && m_db->session_admission_identity() != SessionAdmission::identity_of(config.session_admission))
+        throw SessionAdmissionError(SessionAdmissionError::Reason::incompatible_session);
     if (config.encryption_key.data() && config.encryption_key.size() != 64)
         throw InvalidEncryptionKey();
     if ((config.schema_mode == SchemaMode::AdditiveDiscovered ||
@@ -169,6 +193,9 @@ std::shared_ptr<Realm> RealmCoordinator::get_cached_realm(Realm::Config const& c
 std::shared_ptr<Realm> RealmCoordinator::do_get_cached_realm(Realm::Config const& config,
                                                              std::shared_ptr<util::Scheduler> scheduler)
 {
+    validate_mutable_payload(config);
+    if (m_db && m_db->session_admission_identity() != SessionAdmission::identity_of(config.session_admission))
+        throw SessionAdmissionError(SessionAdmissionError::Reason::incompatible_session);
     if (!config.cache)
         return nullptr;
 
@@ -313,6 +340,7 @@ void RealmCoordinator::bind_to_context(Realm& realm)
 
 bool RealmCoordinator::open_db()
 {
+    validate_mutable_payload(m_config);
     if (m_db)
         return false;
 
@@ -329,6 +357,7 @@ bool RealmCoordinator::open_db()
         }
 
         DBOptions options;
+        options.session_admission = m_config.session_admission;
 #ifndef __EMSCRIPTEN__
         options.enable_async_writes = true;
 #endif
@@ -339,7 +368,7 @@ bool RealmCoordinator::open_db()
         if (!m_config.fifo_files_fallback_path.empty()) {
             options.temp_dir = util::normalize_dir(m_config.fifo_files_fallback_path);
         }
-        options.encryption_key = m_config.encryption_key.data();
+        options.encryption_key = m_config.encryption_key.empty() ? nullptr : m_config.encryption_key.data();
         options.allow_file_format_upgrade = !m_config.disable_format_upgrade && !schema_mode_reset_file;
         options.clear_on_invalid_file = m_config.clear_on_invalid_file;
         if (history) {
@@ -367,14 +396,14 @@ bool RealmCoordinator::open_db()
         if (!schema_mode_reset_file) {
             throw;
         }
-        util::File::remove(m_config.path);
+        remove_payload_with_lock(m_config.path);
         return open_db();
     }
     catch (UnsupportedFileFormatVersion const&) {
         if (!schema_mode_reset_file) {
             throw;
         }
-        util::File::remove(m_config.path);
+        remove_payload_with_lock(m_config.path);
         return open_db();
     }
 
@@ -422,8 +451,9 @@ void RealmCoordinator::close()
 void RealmCoordinator::delete_and_reopen()
 {
     util::CheckedLockGuard lock(m_realm_mutex);
+    validate_mutable_payload(m_config);
     close();
-    util::File::remove(m_config.path);
+    remove_payload_with_lock(m_config.path);
     open_db();
 }
 

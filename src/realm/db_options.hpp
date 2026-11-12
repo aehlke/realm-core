@@ -22,6 +22,7 @@
 #include <functional>
 #include <string>
 #include <realm/backup_restore.hpp>
+#include <realm/session_admission.hpp>
 
 namespace realm {
 
@@ -105,6 +106,9 @@ struct DBOptions {
     /// If set, opening a file which is not a Realm file or cannot be decrypted
     /// will clear and reinitialize the file.
     bool clear_on_invalid_file = false;
+
+    /// Sealed physical-table contract shared by every mutable session participant.
+    std::shared_ptr<const SessionAdmission> session_admission;
 
     /// sys_tmp_dir will be used if the temp_dir is empty when creating DBOptions.
     /// It must be writable and allowed to create pipe/fifo file on it.

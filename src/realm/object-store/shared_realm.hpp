@@ -92,6 +92,7 @@ using ShouldCompactOnLaunchFunction = std::function<bool(uint64_t total_bytes, u
 struct RealmConfig {
     // Path and binary data are mutually exclusive
     std::string path;
+    std::shared_ptr<const SessionAdmission> session_admission;
     BinaryData realm_data;
     // User-supplied encryption key. Must be either empty or 64 bytes.
     std::vector<char> encryption_key;

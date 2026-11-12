@@ -3663,3 +3663,269 @@ TEST_CASE("Notification logging") {
         return ++commit_nr == 10;
     });
 }
+
+
+namespace {
+std::shared_ptr<const SessionAdmission> coordinator_admission_contract(std::string identifier = "coordinator-admission/v1")
+{
+    SessionAdmission::Table table;
+    table.name = "class_Protected";
+    table.columns.push_back({"value", type_Int});
+    return std::make_shared<const SessionAdmission>(std::move(identifier),
+        std::vector<SessionAdmission::Table>{std::move(table)});
+}
+}
+
+TEST_CASE("Session admission belongs to the retained DB, not replacement Realm config", "[session-admission]") {
+    TestFile file;
+    file.encryption_key.clear();
+    file.automatic_change_notifications = false;
+    file.cache = true;
+    file.schema_version = 0;
+    file.schema = Schema{{"Writable", {{"value", PropertyType::Int}}}};
+    Realm::Config config = file;
+    config.session_admission = coordinator_admission_contract();
+    auto coordinator = _impl::RealmCoordinator::get_coordinator(config);
+    auto realm = Realm::get_shared_realm(config);
+    auto actual_db = TestHelper::get_db(realm);
+    REQUIRE(actual_db->session_admission_identity() == config.session_admission->identity());
+
+    Realm::Config equivalent = config;
+    equivalent.session_admission = coordinator_admission_contract();
+    REQUIRE(Realm::get_shared_realm(equivalent) == realm);
+    Realm::Config nil = config;
+    nil.session_admission.reset();
+    REQUIRE_THROWS_AS(Realm::get_shared_realm(nil), SessionAdmissionError);
+    Realm::Config different = config;
+    different.session_admission = coordinator_admission_contract("different-cohort/v1");
+    REQUIRE_THROWS_AS(Realm::get_shared_realm(different), SessionAdmissionError);
+
+    std::weak_ptr<Realm> weak = realm;
+    realm.reset();
+    REQUIRE(weak.expired()); // Causal precondition: every cached Realm entry is dead.
+    REQUIRE_FALSE(DB::call_with_lock(config.path, [](const std::string&) {}));
+    nil.cache = false;
+    different.cache = false;
+    REQUIRE_THROWS_AS(Realm::get_shared_realm(nil), SessionAdmissionError);
+    REQUIRE_THROWS_AS(Realm::get_shared_realm(different), SessionAdmissionError);
+    equivalent.cache = false;
+    auto reopened = Realm::get_shared_realm(equivalent);
+    REQUIRE(TestHelper::get_db(reopened) == actual_db); // No replacement DB can make this test pass.
+    reopened->begin_transaction();
+    reopened->read_group().get_table("class_Writable")->create_object();
+    reopened->commit_transaction();
+}
+
+TEST_CASE("A retained ordinary DB cannot be relabelled as an admitted DB", "[session-admission]") {
+    TestFile file;
+    file.encryption_key.clear();
+    file.automatic_change_notifications = false;
+    file.schema_version = 0;
+    file.schema = Schema{{"Writable", {{"value", PropertyType::Int}}}};
+    auto coordinator = _impl::RealmCoordinator::get_coordinator(file);
+    auto realm = Realm::get_shared_realm(file);
+    auto db = TestHelper::get_db(realm);
+    std::weak_ptr<Realm> weak = realm;
+    realm.reset();
+    REQUIRE(weak.expired());
+    REQUIRE_FALSE(DB::call_with_lock(file.path, [](const std::string&) {}));
+    Realm::Config admitted = file;
+    admitted.cache = false;
+    admitted.session_admission = coordinator_admission_contract();
+    REQUIRE_THROWS_AS(Realm::get_shared_realm(admitted), SessionAdmissionError);
+    REQUIRE(db->session_admission_identity() == SessionAdmission::Identity{});
+}
+
+TEST_CASE("Immutable readers cannot carry writer admission or write; later writers remain fenced", "[session-admission]") {
+    TestFile file;
+    file.encryption_key.clear();
+    file.automatic_change_notifications = false;
+    file.schema_version = 0;
+    file.schema = Schema{{"Writable", {{"value", PropertyType::Int}}}};
+    {
+        auto seed = Realm::get_shared_realm(file);
+    }
+    {
+        Realm::Config immutable = file;
+        immutable.schema_mode = SchemaMode::Immutable;
+        auto reader = Realm::get_shared_realm(immutable);
+        REQUIRE(reader->config().immutable());
+        REQUIRE_THROWS_AS(reader->begin_transaction(), WrongTransactionState);
+        REQUIRE_FALSE(reader->is_in_transaction());
+        immutable.session_admission = coordinator_admission_contract();
+        REQUIRE_THROWS_AS(Realm::get_shared_realm(immutable), SessionAdmissionError);
+    }
+    Realm::Config admitted = file;
+    admitted.session_admission = coordinator_admission_contract();
+    auto writer = Realm::get_shared_realm(admitted);
+    REQUIRE(TestHelper::get_db(writer)->session_admission_identity() == admitted.session_admission->identity());
+    REQUIRE_THROWS_AS(Realm::get_shared_realm(file), SessionAdmissionError);
+    writer->begin_transaction();
+    writer->read_group().get_table("class_Writable")->create_object();
+    writer->commit_transaction();
+}
+
+#include <exception>
+
+
+TEST_CASE("Frozen and cross-thread Realms retain the actual admitted DB capability", "[session-admission]") {
+    TestFile file;
+    file.encryption_key.clear();
+    file.automatic_change_notifications = false;
+    file.cache = true;
+    file.schema_version = 0;
+    file.schema = Schema{{"Writable", {{"value", PropertyType::Int}}}};
+    Realm::Config admitted = file;
+    admitted.session_admission = coordinator_admission_contract();
+    auto coordinator = _impl::RealmCoordinator::get_coordinator(admitted);
+    auto live = Realm::get_shared_realm(admitted);
+    auto actual_db = TestHelper::get_db(live);
+    SharedRealm frozen;
+    DBRef cross_thread_db;
+    std::exception_ptr thread_error;
+    bool cross_thread_nil_denied = false, cross_thread_different_denied = false;
+    {
+        JoiningThread thread([&] {
+            try {
+                Realm::Config equivalent = admitted;
+                equivalent.session_admission = coordinator_admission_contract();
+                auto cross_thread = Realm::get_shared_realm(equivalent);
+                cross_thread_db = TestHelper::get_db(cross_thread);
+                Realm::Config nil = equivalent;
+                nil.session_admission.reset();
+                try { auto refused = Realm::get_shared_realm(nil); }
+                catch (const SessionAdmissionError& error) {
+                    cross_thread_nil_denied = error.reason == SessionAdmissionError::Reason::incompatible_session;
+                }
+                Realm::Config different = equivalent;
+                different.session_admission = coordinator_admission_contract("other-thread-cohort/v1");
+                try { auto refused = Realm::get_shared_realm(different); }
+                catch (const SessionAdmissionError& error) {
+                    cross_thread_different_denied = error.reason == SessionAdmissionError::Reason::incompatible_session;
+                }
+                cross_thread->read_group();
+                frozen = cross_thread->freeze();
+            }
+            catch (...) { thread_error = std::current_exception(); }
+        });
+    }
+    if (thread_error) std::rethrow_exception(thread_error);
+    REQUIRE(cross_thread_db == actual_db);
+    REQUIRE(cross_thread_nil_denied);
+    REQUIRE(cross_thread_different_denied);
+    REQUIRE(frozen);
+    REQUIRE(frozen->is_frozen());
+    REQUIRE(TestHelper::get_db(frozen) == actual_db);
+    std::weak_ptr<Realm> weak_live = live;
+    live.reset();
+    REQUIRE(weak_live.expired()); // No live source Realm is making the denial pass.
+    REQUIRE_FALSE(DB::call_with_lock(file.path, [](const std::string&) {}));
+    for (bool cache : {false, true}) {
+        Realm::Config nil = admitted;
+        nil.cache = cache;
+        nil.session_admission.reset();
+        REQUIRE_THROWS_AS(Realm::get_shared_realm(nil), SessionAdmissionError);
+        Realm::Config different = admitted;
+        different.cache = cache;
+        different.session_admission = coordinator_admission_contract("other-frozen-cohort/v1");
+        REQUIRE_THROWS_AS(Realm::get_shared_realm(different), SessionAdmissionError);
+    }
+    auto matching = Realm::get_shared_realm(admitted);
+    REQUIRE(TestHelper::get_db(matching) == actual_db);
+    matching->begin_transaction();
+    matching->read_group().get_table("class_Writable")->create_object();
+    matching->commit_transaction();
+    REQUIRE(frozen->read_group().get_table("class_Writable")->size() == 0);
+    REQUIRE(matching->read_group().get_table("class_Writable")->size() == 1);
+}
+
+#ifndef _WIN32
+#include <unistd.h>
+#include <fstream>
+#include <iterator>
+
+TEST_CASE("Mutable Object Store aliases fail in both owner directions before file effects", "[session-admission]") {
+    for (bool admitted_owner : {false, true}) {
+        TestFile target, alias;
+        target.encryption_key.clear();
+        target.automatic_change_notifications = false;
+        target.schema_version = 0;
+        target.schema = Schema{{"Writable", {{"value", PropertyType::Int}}}};
+        Realm::Config canonical = target;
+        if (admitted_owner) canonical.session_admission = coordinator_admission_contract();
+        auto owner = Realm::get_shared_realm(canonical);
+        owner->begin_transaction();
+        owner->read_group().get_table("class_Writable")->create_object();
+        owner->commit_transaction();
+        REQUIRE(::symlink(target.path.c_str(), alias.path.c_str()) == 0);
+        auto read_bytes = [](const std::string& path) {
+            std::ifstream input(path, std::ios::binary);
+            if (!input) throw std::runtime_error("Cannot read alias fixture");
+            return std::string(std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{});
+        };
+        auto bytes = read_bytes(target.path);
+        auto inode = util::File::get_unique_id(target.path);
+        auto modified = util::File::last_write_time(target.path);
+        auto lock_path = target.path + ".lock";
+        auto lock_inode = util::File::get_unique_id(lock_path);
+        auto lock_bytes = read_bytes(lock_path);
+        Realm::Config contender = canonical;
+        contender.path = alias.path;
+        contender.session_admission = admitted_owner ? nullptr : coordinator_admission_contract();
+        for (bool cached : {false, true}) {
+            contender.cache = cached;
+            REQUIRE_THROWS_AS(Realm::get_shared_realm(contender), SessionAdmissionError);
+        }
+        REQUIRE_THROWS_AS(Realm::delete_files(alias.path), SessionAdmissionError);
+        REQUIRE_THROWS_AS(owner->convert(contender, false), SessionAdmissionError);
+        REQUIRE_THROWS_AS(owner->convert(contender, true), SessionAdmissionError);
+        REQUIRE(read_bytes(target.path) == bytes);
+        REQUIRE(util::File::get_unique_id(target.path) == inode);
+        REQUIRE(util::File::last_write_time(target.path) == modified);
+        REQUIRE(util::File::get_unique_id(lock_path) == lock_inode);
+        REQUIRE(read_bytes(lock_path) == lock_bytes);
+        REQUIRE_FALSE(util::File::exists(alias.path + ".lock"));
+        REQUIRE(owner->read_group().get_table("class_Writable")->size() == 1);
+    }
+}
+
+TEST_CASE("Mutable cache and reset entrypoints recheck the named payload", "[session-admission]") {
+    for (bool admitted : {false, true}) {
+        TestFile target, moved;
+        target.encryption_key.clear();
+        target.automatic_change_notifications = false;
+        target.cache = true;
+        target.schema_version = 0;
+        target.schema = Schema{{"Writable", {{"value", PropertyType::Int}}}};
+        Realm::Config config = target;
+        if (admitted) config.session_admission = coordinator_admission_contract();
+        auto owner = Realm::get_shared_realm(config);
+        auto coordinator = _impl::RealmCoordinator::get_coordinator(config);
+        auto actual_db = TestHelper::get_db(owner);
+        auto inode = util::File::get_unique_id(target.path);
+        auto lock_inode = util::File::get_unique_id(target.path + ".lock");
+        {
+            // Deliberately mutate this fixture after open to exercise the cache
+            // seam. This is not a claim to serialize arbitrary path replacement.
+            util::File::move(target.path, moved.path);
+            util::ScopeExit restore([&] {
+                util::File::try_remove(target.path);
+                util::File::move(moved.path, target.path);
+            });
+            REQUIRE(::symlink(moved.path.c_str(), target.path.c_str()) == 0);
+            REQUIRE_THROWS_AS(Realm::get_shared_realm(config), SessionAdmissionError);
+            REQUIRE_THROWS_AS(coordinator->get_cached_realm(config, owner->scheduler()), SessionAdmissionError);
+            REQUIRE_THROWS_AS(coordinator->delete_and_reopen(), SessionAdmissionError);
+            REQUIRE_THROWS_AS(actual_db->compact(), SessionAdmissionError);
+            REQUIRE(TestHelper::get_db(owner) == actual_db);
+            REQUIRE(actual_db->is_attached());
+            REQUIRE_FALSE(util::File::exists(target.path + ".tmp_compaction_space"));
+        }
+        REQUIRE(util::File::get_unique_id(target.path) == inode);
+        REQUIRE(util::File::get_unique_id(target.path + ".lock") == lock_inode);
+        owner->begin_transaction();
+        owner->read_group().get_table("class_Writable")->create_object();
+        owner->commit_transaction();
+    }
+}
+#endif

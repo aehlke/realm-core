@@ -231,10 +231,9 @@ void Realm::read_schema_from_group_if_needed()
 
 bool Realm::reset_file(Schema& schema, std::vector<SchemaChange>& required_changes)
 {
-    // FIXME: this does not work if multiple processes try to open the file at
-    // the same time, or even multiple threads if there is not any external
-    // synchronization. The latter is probably fixable, but making it
-    // multi-process-safe requires some sort of multi-process exclusive lock
+    // Payload deletion uses the actual adjacent exclusive lock. The subsequent
+    // reopen/schema reset is still not atomic with respect to other openers;
+    // reset-file modes must not be used for admitted Reader stores.
     m_transaction = nullptr;
     m_coordinator->delete_and_reopen();
 
@@ -1105,6 +1104,7 @@ void Realm::convert(const Config& config, bool merge_into_existing)
 {
     verify_thread();
     verify_open();
+    SessionAdmission::validate_payload_path(config.path);
 
     if (merge_into_existing && util::File::exists(config.path)) {
         auto destination_realm = Realm::get_shared_realm(config);
