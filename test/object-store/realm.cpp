@@ -49,6 +49,7 @@
 #include <external/json/json.hpp>
 
 #include <array>
+#include <exception>
 #if REALM_HAVE_UV
 #include <uv.h>
 #endif // REALM_HAVE_UV
@@ -3693,9 +3694,9 @@ TEST_CASE("Session admission belongs to the retained DB, not replacement Realm c
     Realm::Config equivalent = config;
     equivalent.session_admission = coordinator_admission_contract();
     REQUIRE(Realm::get_shared_realm(equivalent) == realm);
-    Realm::Config nil = config;
-    nil.session_admission.reset();
-    REQUIRE_THROWS_AS(Realm::get_shared_realm(nil), SessionAdmissionError);
+    Realm::Config unadmitted = config;
+    unadmitted.session_admission.reset();
+    REQUIRE_THROWS_AS(Realm::get_shared_realm(unadmitted), SessionAdmissionError);
     Realm::Config different = config;
     different.session_admission = coordinator_admission_contract("different-cohort/v1");
     REQUIRE_THROWS_AS(Realm::get_shared_realm(different), SessionAdmissionError);
@@ -3704,9 +3705,9 @@ TEST_CASE("Session admission belongs to the retained DB, not replacement Realm c
     realm.reset();
     REQUIRE(weak.expired()); // Causal precondition: every cached Realm entry is dead.
     REQUIRE_FALSE(DB::call_with_lock(config.path, [](const std::string&) {}));
-    nil.cache = false;
+    unadmitted.cache = false;
     different.cache = false;
-    REQUIRE_THROWS_AS(Realm::get_shared_realm(nil), SessionAdmissionError);
+    REQUIRE_THROWS_AS(Realm::get_shared_realm(unadmitted), SessionAdmissionError);
     REQUIRE_THROWS_AS(Realm::get_shared_realm(different), SessionAdmissionError);
     equivalent.cache = false;
     auto reopened = Realm::get_shared_realm(equivalent);
@@ -3791,9 +3792,9 @@ TEST_CASE("Frozen and cross-thread Realms retain the actual admitted DB capabili
                 equivalent.session_admission = coordinator_admission_contract();
                 auto cross_thread = Realm::get_shared_realm(equivalent);
                 cross_thread_db = TestHelper::get_db(cross_thread);
-                Realm::Config nil = equivalent;
-                nil.session_admission.reset();
-                try { auto refused = Realm::get_shared_realm(nil); }
+                Realm::Config unadmitted = equivalent;
+                unadmitted.session_admission.reset();
+                try { auto refused = Realm::get_shared_realm(unadmitted); }
                 catch (const SessionAdmissionError& error) {
                     cross_thread_nil_denied = error.reason == SessionAdmissionError::Reason::incompatible_session;
                 }
@@ -3821,10 +3822,10 @@ TEST_CASE("Frozen and cross-thread Realms retain the actual admitted DB capabili
     REQUIRE(weak_live.expired()); // No live source Realm is making the denial pass.
     REQUIRE_FALSE(DB::call_with_lock(file.path, [](const std::string&) {}));
     for (bool cache : {false, true}) {
-        Realm::Config nil = admitted;
-        nil.cache = cache;
-        nil.session_admission.reset();
-        REQUIRE_THROWS_AS(Realm::get_shared_realm(nil), SessionAdmissionError);
+        Realm::Config unadmitted = admitted;
+        unadmitted.cache = cache;
+        unadmitted.session_admission.reset();
+        REQUIRE_THROWS_AS(Realm::get_shared_realm(unadmitted), SessionAdmissionError);
         Realm::Config different = admitted;
         different.cache = cache;
         different.session_admission = coordinator_admission_contract("other-frozen-cohort/v1");
@@ -3908,18 +3909,26 @@ TEST_CASE("Mutable cache and reset entrypoints recheck the named payload", "[ses
             // Deliberately mutate this fixture after open to exercise the cache
             // seam. This is not a claim to serialize arbitrary path replacement.
             util::File::move(target.path, moved.path);
-            util::ScopeExit restore([&] {
-                util::File::try_remove(target.path);
-                util::File::move(moved.path, target.path);
-            });
-            REQUIRE(::symlink(moved.path.c_str(), target.path.c_str()) == 0);
-            REQUIRE_THROWS_AS(Realm::get_shared_realm(config), SessionAdmissionError);
-            REQUIRE_THROWS_AS(coordinator->get_cached_realm(config, owner->scheduler()), SessionAdmissionError);
-            REQUIRE_THROWS_AS(coordinator->delete_and_reopen(), SessionAdmissionError);
-            REQUIRE_THROWS_AS(actual_db->compact(), SessionAdmissionError);
-            REQUIRE(TestHelper::get_db(owner) == actual_db);
-            REQUIRE(actual_db->is_attached());
-            REQUIRE_FALSE(util::File::exists(target.path + ".tmp_compaction_space"));
+            // Restore outside stack unwinding so filesystem failures are test
+            // failures, not exceptions from a noexcept cleanup destructor.
+            std::exception_ptr assertion_failure;
+            try {
+                REQUIRE(::symlink(moved.path.c_str(), target.path.c_str()) == 0);
+                REQUIRE_THROWS_AS(Realm::get_shared_realm(config), SessionAdmissionError);
+                REQUIRE_THROWS_AS(coordinator->get_cached_realm(config, owner->scheduler()), SessionAdmissionError);
+                REQUIRE_THROWS_AS(coordinator->delete_and_reopen(), SessionAdmissionError);
+                REQUIRE_THROWS_AS(actual_db->compact(), SessionAdmissionError);
+                REQUIRE(TestHelper::get_db(owner) == actual_db);
+                REQUIRE(actual_db->is_attached());
+                REQUIRE_FALSE(util::File::exists(target.path + ".tmp_compaction_space"));
+            }
+            catch (...) {
+                assertion_failure = std::current_exception();
+            }
+            CHECK_NOTHROW(util::File::try_remove(target.path));
+            CHECK_NOTHROW(util::File::move(moved.path, target.path));
+            if (assertion_failure)
+                std::rethrow_exception(assertion_failure);
         }
         REQUIRE(util::File::get_unique_id(target.path) == inode);
         REQUIRE(util::File::get_unique_id(target.path + ".lock") == lock_inode);
