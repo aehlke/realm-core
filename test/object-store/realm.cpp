@@ -49,6 +49,7 @@
 #include <external/json/json.hpp>
 
 #include <array>
+#include <exception>
 #if REALM_HAVE_UV
 #include <uv.h>
 #endif // REALM_HAVE_UV
@@ -3662,4 +3663,55 @@ TEST_CASE("Notification logging") {
         }
         return ++commit_nr == 10;
     });
+}
+
+TEST_CASE("SharedRealm: freeze pins version before delayed first read", "[freeze-version-pin]") {
+    for (bool cache : {false, true}) {
+        TestFile file;
+        file.encryption_key.clear();
+        file.automatic_change_notifications = false;
+        file.cache = cache;
+        file.schema_version = 0;
+        file.schema = Schema{{"Writable", {{"value", PropertyType::Int}}}};
+        auto live = Realm::get_shared_realm(file);
+        auto actual_db = TestHelper::get_db(live);
+        SharedRealm frozen;
+        std::exception_ptr thread_error;
+        bool reused_cached_frozen = false;
+        {
+            JoiningThread thread([&] {
+                try {
+                    auto source = Realm::get_shared_realm(file);
+                    source->read_group();
+                    frozen = source->freeze();
+                    if (cache)
+                        reused_cached_frozen = source->freeze() == frozen;
+                }
+                catch (...) {
+                    thread_error = std::current_exception();
+                }
+            });
+        }
+        if (thread_error)
+            std::rethrow_exception(thread_error);
+        REQUIRE(frozen);
+        REQUIRE(frozen->is_frozen());
+        // This observer does not start a read: freeze() itself must own the pin.
+        REQUIRE(frozen->is_in_read_transaction());
+        REQUIRE(TestHelper::get_db(frozen) == actual_db);
+        if (cache)
+            REQUIRE(reused_cached_frozen);
+        std::weak_ptr<Realm> weak_live = live;
+        live.reset();
+        REQUIRE(weak_live.expired());
+        // No live source read is keeping the old version alive. Defer the first
+        // frozen data read until after a new live Realm has committed a write.
+        auto matching = Realm::get_shared_realm(file);
+        REQUIRE(TestHelper::get_db(matching) == actual_db);
+        matching->begin_transaction();
+        matching->read_group().get_table("class_Writable")->create_object();
+        matching->commit_transaction();
+        REQUIRE(frozen->read_group().get_table("class_Writable")->size() == 0);
+        REQUIRE(matching->read_group().get_table("class_Writable")->size() == 1);
+    }
 }
